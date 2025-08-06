@@ -5,7 +5,8 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-const API_TOKEN = process.env.PD_API_TOKEN || 'd92decd10ac756b8d61ef9ee7446cebc365ae059';
+// Constants (move to Railway ENV later)
+const API_TOKEN = process.env.API_TOKEN || 'd92decd10ac756b8d61ef9ee7446cebc365ae059';
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
 
 const PRODUCTION_TEAM_MAP = {
@@ -22,66 +23,73 @@ const PRODUCTION_TEAM_MAP = {
 app.use(bodyParser.json());
 
 app.post('/', async (req, res) => {
-  console.log('📩 Webhook payload received:', JSON.stringify(req.body, null, 2));
-  const activityId = req.body.meta?.id || req.body.meta?.activity_id;
+  console.log('📥 Incoming webhook:', JSON.stringify(req.body, null, 2));
 
-  if (!activityId) {
-    console.log('❌ No Activity ID found');
-    return res.status(400).send('Missing activity ID');
+  const body = req.body;
+  const activityId = body?.current?.id;
+  const dealId = body?.current?.deal_id;
+
+  if (!activityId || !dealId) {
+    console.log('❌ Missing activityId or dealId');
+    return res.status(400).send('Missing activity or deal ID');
   }
 
   try {
-    const activityRes = await axios.get(
-      `https://api.pipedrive.com/v1/activities/${activityId}?api_token=${API_TOKEN}`
-    );
-    const activity = activityRes.data.data;
+    const dealResp = await axios.get(`https://api.pipedrive.com/v1/deals/${dealId}?api_token=${API_TOKEN}`);
+    const deal = dealResp.data?.data;
 
-    if (!activity || activity.done === 1) {
-      console.log(`⏭️ Skipping completed or missing activity: ${activityId}`);
-      return res.status(200).send('Skipped');
+    if (!deal) {
+      console.log(`❌ Deal ${dealId} not found`);
+      return res.status(404).send('Deal not found');
     }
 
-    if (!activity.deal_id) {
-      console.log(`⏭️ No deal linked to activity ${activityId}`);
-      return res.status(200).send('No linked deal');
+    const dealTitle = deal.title;
+    const teamId = deal[PRODUCTION_TEAM_FIELD_KEY];
+    const productionTeam = PRODUCTION_TEAM_MAP[teamId];
+
+    if (!productionTeam) {
+      console.log(`⚠️ No valid team for deal ${dealId}`);
+      return res.status(200).send('No valid team');
     }
 
-    const dealRes = await axios.get(
-      `https://api.pipedrive.com/v1/deals/${activity.deal_id}?api_token=${API_TOKEN}`
-    );
-    const deal = dealRes.data.data;
+    const activityResp = await axios.get(`https://api.pipedrive.com/v1/activities/${activityId}?api_token=${API_TOKEN}`);
+    const activity = activityResp.data?.data;
 
-    const productionId = deal[PRODUCTION_TEAM_FIELD_KEY];
-    const productionName = PRODUCTION_TEAM_MAP[productionId];
-    if (!productionName) {
-      console.log(`⏭️ No valid production team on deal ${deal.id}`);
-      return res.status(200).send('No production team');
+    if (!activity) {
+      console.log(`❌ Activity ${activityId} not found`);
+      return res.status(404).send('Activity not found');
+    }
+
+    const lowerSubject = activity.subject?.toLowerCase() || '';
+    if (!lowerSubject.includes('production') && !lowerSubject.includes('moisture_check')) {
+      return res.status(200).send('Not a tracked task');
     }
 
     const icon = activity.type === 'Moisture Check/Pickup' ? '🚚' : '📌';
-    const newSubject = `${icon} ${activity.type} - ${deal.title} - ${productionName}`;
+    const newSubject = `${icon} ${activity.type} - ${dealTitle} - ${productionTeam}`;
 
-    const updateRes = await axios.put(
+    const update = await axios.put(
       `https://api.pipedrive.com/v1/activities/${activityId}?api_token=${API_TOKEN}`,
       { subject: newSubject },
       { headers: { 'Content-Type': 'application/json' } }
     );
 
-    if (updateRes.data.success) {
-      console.log(`✅ Renamed activity ${activityId} to "${newSubject}"`);
-      return res.status(200).send('Renamed');
+    if (update.data.success) {
+      console.log(`✅ Updated activity ${activityId}`);
+      return res.status(200).send('Updated');
     } else {
-      console.log(`❌ Failed to rename activity ${activityId}`);
-      return res.status(500).send('Rename failed');
+      console.log(`❌ Failed to update activity ${activityId}`);
+      return res.status(500).send('Update failed');
     }
   } catch (err) {
-    console.error('❌ Error handling webhook:', err.message);
-    return res.status(500).send('Internal error');
+    console.error('❌ Exception:', err.message);
+    return res.status(500).send('Internal server error');
   }
 });
 
+// Health check
 app.get('/', (req, res) => {
-  res.send('✅ Activity rename webhook is running');
+  res.send('✅ Task Rename Webhook is running');
 });
 
 app.listen(PORT, () => {
