@@ -17,7 +17,7 @@ const PRODUCTION_TEAM_MAP = {
   51: 'Sebastian',
   52: 'Anastacio',
   53: 'Mike',
-  54: 'Kim'
+  54: 'Gary'
 };
 
 app.use(bodyParser.json());
@@ -26,15 +26,29 @@ app.post('/', async (req, res) => {
   console.log('📥 Incoming webhook:', JSON.stringify(req.body, null, 2));
 
   const body = req.body;
-  const activityId = body?.current?.id;
-  const dealId = body?.current?.deal_id;
+  const activityId = body?.meta?.id;
 
-  if (!activityId || !dealId) {
-    console.log('❌ Missing activityId or dealId');
-    return res.status(400).send('Missing activity or deal ID');
+  if (!activityId) {
+    console.log('❌ Missing activityId');
+    return res.status(400).send('Missing activity ID');
   }
 
   try {
+    const activityResp = await axios.get(`https://api.pipedrive.com/v1/activities/${activityId}?api_token=${API_TOKEN}`);
+    const activity = activityResp.data?.data;
+
+    if (!activity) {
+      console.log(`❌ Activity ${activityId} not found`);
+      return res.status(404).send('Activity not found');
+    }
+
+    const dealId = activity.deal_id;
+
+    if (!dealId) {
+      console.log(`❌ No deal associated with activity ${activityId}`);
+      return res.status(400).send('No associated deal');
+    }
+
     const dealResp = await axios.get(`https://api.pipedrive.com/v1/deals/${dealId}?api_token=${API_TOKEN}`);
     const deal = dealResp.data?.data;
 
@@ -50,14 +64,6 @@ app.post('/', async (req, res) => {
     if (!productionTeam) {
       console.log(`⚠️ No valid team for deal ${dealId}`);
       return res.status(200).send('No valid team');
-    }
-
-    const activityResp = await axios.get(`https://api.pipedrive.com/v1/activities/${activityId}?api_token=${API_TOKEN}`);
-    const activity = activityResp.data?.data;
-
-    if (!activity) {
-      console.log(`❌ Activity ${activityId} not found`);
-      return res.status(404).send('Activity not found');
     }
 
     const lowerSubject = activity.subject?.toLowerCase() || '';
@@ -83,6 +89,7 @@ app.post('/', async (req, res) => {
     }
   } catch (err) {
     console.error('❌ Exception:', err.message);
+    console.error(err.stack);
     return res.status(500).send('Internal server error');
   }
 });
