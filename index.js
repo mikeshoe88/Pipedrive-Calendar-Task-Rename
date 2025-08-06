@@ -1,4 +1,11 @@
-const API_TOKEN = 'd92decd10ac756b8d61ef9ee7446cebc365ae059';
+const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
+
+const app = express();
+const PORT = process.env.PORT || 8080;
+
+const API_TOKEN = process.env.PD_API_TOKEN || 'd92decd10ac756b8d61ef9ee7446cebc365ae059';
 const PRODUCTION_TEAM_FIELD_KEY = '8bbab3c120ade3217b8738f001033064e803cdef';
 
 const PRODUCTION_TEAM_MAP = {
@@ -12,119 +19,71 @@ const PRODUCTION_TEAM_MAP = {
   54: 'Kim'
 };
 
-function updateExistingTasksWithDealAndTeam() {
-  const taskResponse = UrlFetchApp.fetch(`https://api.pipedrive.com/v1/activities?limit=100&api_token=${API_TOKEN}`);
-  const taskData = JSON.parse(taskResponse.getContentText());
+app.use(bodyParser.json());
 
-  if (!taskData.success || !taskData.data) {
-    Logger.log('❌ Failed to fetch tasks');
-    return;
+app.post('/', async (req, res) => {
+  console.log('📩 Webhook payload received:', JSON.stringify(req.body, null, 2));
+  const activityId = req.body.meta?.id || req.body.meta?.activity_id;
+
+  if (!activityId) {
+    console.log('❌ No Activity ID found');
+    return res.status(400).send('Missing activity ID');
   }
 
-  const tasks = taskData.data;
+  try {
+    const activityRes = await axios.get(
+      `https://api.pipedrive.com/v1/activities/${activityId}?api_token=${API_TOKEN}`
+    );
+    const activity = activityRes.data.data;
 
-  tasks.forEach(task => {
-    if (task.done === 1) return;
-
-    const dealId = task.deal_id;
-    if (!dealId) return;
-
-    const dealResponse = UrlFetchApp.fetch(`https://api.pipedrive.com/v1/deals/${dealId}?api_token=${API_TOKEN}`);
-    const dealData = JSON.parse(dealResponse.getContentText());
-
-    if (!dealData.success || !dealData.data) {
-      Logger.log(`⚠️ Could not fetch deal ${dealId}`);
-      return;
+    if (!activity || activity.done === 1) {
+      console.log(`⏭️ Skipping completed or missing activity: ${activityId}`);
+      return res.status(200).send('Skipped');
     }
 
-    const dealTitle = dealData.data.title;
-    const teamId = dealData.data[PRODUCTION_TEAM_FIELD_KEY];
-    const productionTeam = PRODUCTION_TEAM_MAP[teamId];
-
-    if (!productionTeam) {
-      Logger.log(`⏭️ Skipping task ${task.id} - no valid production team.`);
-      return;
+    if (!activity.deal_id) {
+      console.log(`⏭️ No deal linked to activity ${activityId}`);
+      return res.status(200).send('No linked deal');
     }
 
-    const icon = task.type === 'Moisture Check/Pickup' ? '🚚' : '📌';
-    const newSubject = `${icon} ${task.type} - ${dealTitle} - ${productionTeam}`;
+    const dealRes = await axios.get(
+      `https://api.pipedrive.com/v1/deals/${activity.deal_id}?api_token=${API_TOKEN}`
+    );
+    const deal = dealRes.data.data;
 
-    const updateOptions = {
-      method: 'PUT',
-      contentType: 'application/json',
-      payload: JSON.stringify({ subject: newSubject })
-    };
+    const productionId = deal[PRODUCTION_TEAM_FIELD_KEY];
+    const productionName = PRODUCTION_TEAM_MAP[productionId];
+    if (!productionName) {
+      console.log(`⏭️ No valid production team on deal ${deal.id}`);
+      return res.status(200).send('No production team');
+    }
 
-    const updateResponse = UrlFetchApp.fetch(`https://api.pipedrive.com/v1/activities/${task.id}?api_token=${API_TOKEN}`, updateOptions);
-    const updateResult = JSON.parse(updateResponse.getContentText());
+    const icon = activity.type === 'Moisture Check/Pickup' ? '🚚' : '📌';
+    const newSubject = `${icon} ${activity.type} - ${deal.title} - ${productionName}`;
 
-    if (updateResult.success) {
-      Logger.log(`✅ Updated task ${task.id} with subject: ${newSubject}`);
+    const updateRes = await axios.put(
+      `https://api.pipedrive.com/v1/activities/${activityId}?api_token=${API_TOKEN}`,
+      { subject: newSubject },
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+
+    if (updateRes.data.success) {
+      console.log(`✅ Renamed activity ${activityId} to "${newSubject}"`);
+      return res.status(200).send('Renamed');
     } else {
-      Logger.log(`❌ Failed to update task ${task.id}`);
+      console.log(`❌ Failed to rename activity ${activityId}`);
+      return res.status(500).send('Rename failed');
     }
-  });
-}
-
-function createMoistureCheckTasks() {
-  const props = PropertiesService.getScriptProperties();
-  const processedIds = JSON.parse(props.getProperty('processedMcDealIds') || '[]');
-
-  const response = UrlFetchApp.fetch(`https://api.pipedrive.com/v1/deals?api_token=${API_TOKEN}`);
-  const data = JSON.parse(response.getContentText());
-
-  if (!data.success || !data.data) {
-    Logger.log('❌ Failed to fetch deals');
-    return;
+  } catch (err) {
+    console.error('❌ Error handling webhook:', err.message);
+    return res.status(500).send('Internal error');
   }
+});
 
-  const deals = data.data;
+app.get('/', (req, res) => {
+  res.send('✅ Activity rename webhook is running');
+});
 
-  deals.forEach(deal => {
-    const dealId = deal.id;
-    const dealTitle = deal.title;
-    const teamId = deal[PRODUCTION_TEAM_FIELD_KEY];
-    const productionTeam = PRODUCTION_TEAM_MAP[teamId];
-
-    if (!productionTeam) {
-      Logger.log(`⏭️ Skipping task for deal ${dealId} - no valid production team.`);
-      return;
-    }
-
-    if (processedIds.includes(dealId)) {
-      Logger.log(`ℹ️ Deal ${dealId} already processed for MC task`);
-      return;
-    }
-
-    const taskBody = {
-      subject: `🚚 Moisture Check - ${dealTitle} - ${productionTeam}`,
-      type: 'Moisture Check/Pickup',
-      deal_id: dealId,
-      done: 0,
-      due_date: new Date().toISOString().split('T')[0]
-    };
-
-    const taskOptions = {
-      method: 'post',
-      contentType: 'application/json',
-      payload: JSON.stringify(taskBody)
-    };
-
-    const taskResponse = UrlFetchApp.fetch(`https://api.pipedrive.com/v1/activities?api_token=${API_TOKEN}`, taskOptions);
-    const taskResult = JSON.parse(taskResponse.getContentText());
-
-    if (taskResult.success) {
-      Logger.log(`✅ Moisture Check task created for deal ${dealId}`);
-      processedIds.push(dealId);
-    } else {
-      Logger.log(`❌ Failed to create MC task for deal ${dealId}`);
-    }
-  });
-
-  props.setProperty('processedMcDealIds', JSON.stringify(processedIds));
-}
-
-function resetProcessedMcDeals() {
-  PropertiesService.getScriptProperties().deleteProperty('processedMcDealIds');
-  Logger.log('✅ processedMcDealIds reset');
-}
+app.listen(PORT, () => {
+  console.log(`🚀 Server listening on port ${PORT}`);
+});
