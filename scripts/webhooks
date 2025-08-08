@@ -1,0 +1,19 @@
+const axios = require("axios");
+
+const API_TOKEN = process.env.API_TOKEN;
+if (!API_TOKEN) {
+  console.error("d92decd10ac756b8d61ef9ee7446cebc365ae059");
+  process.exit(1);
+}
+
+(async () => {
+  try {
+    const r = await axios.get("https://api.pipedrive.com/v1/webhooks", {
+      params: { api_token: API_TOKEN }
+    });
+    console.log(JSON.stringify(r.data, null, 2));
+  } catch (e) {
+    console.error("❌ Error:", e?.response?.data || e.message);
+    process.exit(1);
+  }
+})();
