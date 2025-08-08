@@ -2,15 +2,17 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
 
-// ----- Config (env with sane fallbacks) -----
+// ===== Required env (no fallbacks) =====
 const PORT = process.env.PORT || 8080;
-const API_TOKEN = process.env.API_TOKEN || "YOUR_PD_API_TOKEN";
-const PD_SECRET = process.env.PD_WEBHOOK_KEY || "8675309"; // shared secret (?key=...)
-const PRODUCTION_TEAM_FIELD_KEY =
-  process.env.PRODUCTION_TEAM_FIELD_KEY ||
-  "8bbab3c120ade3217b8738f001033064e803cdef";
+const API_TOKEN = process.env.API_TOKEN;
+const PD_SECRET = process.env.PD_WEBHOOK_KEY; // your ?key=... value
+const PRODUCTION_TEAM_FIELD_KEY = process.env.PRODUCTION_TEAM_FIELD_KEY;
 
-// Make sure these labels match your PD custom field options (enum IDs → names)
+if (!API_TOKEN) throw new Error("Missing API_TOKEN");
+if (!PD_SECRET) throw new Error("Missing PD_WEBHOOK_KEY");
+if (!PRODUCTION_TEAM_FIELD_KEY) throw new Error("Missing PRODUCTION_TEAM_FIELD_KEY");
+
+// Map your Production Team enum IDs -> names (confirm 54 is Kim vs Gary)
 const PRODUCTION_TEAM_MAP = {
   47: "Kings",
   48: "Johnathan",
@@ -19,10 +21,10 @@ const PRODUCTION_TEAM_MAP = {
   51: "Sebastian",
   52: "Anastacio",
   53: "Mike",
-  54: "Kim" // confirm if this is Kim or Gary in your account
+  54: "Kim"
 };
 
-// Only these activity types will be renamed (match Pipedrive Activity Type EXACTLY)
+// Activity Types we rename (must match PD labels exactly; tweak as needed)
 const ALLOWED_TYPES = new Set([
   "Moisture Check",
   "Moisture Pickup",
@@ -31,8 +33,6 @@ const ALLOWED_TYPES = new Set([
   "Inspection",
   "Production"
 ]);
-
-// -------------------------------------------
 
 const app = express();
 app.use(bodyParser.json({ type: "*/*" }));
@@ -43,28 +43,22 @@ const pd = axios.create({
   headers: { "Content-Type": "application/json" }
 });
 
-// Helpers
+// -------- Helpers --------
 async function getActivity(activityId) {
   const r = await pd.get(`/activities/${activityId}`);
   return r.data?.success ? r.data.data : null;
 }
-
 async function getDeal(dealId) {
   const r = await pd.get(`/deals/${dealId}`);
   return r.data?.success ? r.data.data : null;
 }
-
 function crewNamesFromDeal(deal) {
   const raw = deal?.[PRODUCTION_TEAM_FIELD_KEY];
-  if (raw == null) return [];
-
-  // Handle single ID or multi-select (array of IDs)
-  const ids = Array.isArray(raw) ? raw : [raw];
+  const ids = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
   return ids.map((id) => PRODUCTION_TEAM_MAP[id]).filter(Boolean);
 }
-
 function buildSubject({ deal, activity, crewNames }) {
-  // Subject template — tweak to taste
+  // Subject format — tweak if you want a different order
   // Example: [JOB 1234] Smith Residence — Moisture Check — Crew: Mike, Hector
   const jobId = deal?.id;
   const who =
@@ -73,81 +67,75 @@ function buildSubject({ deal, activity, crewNames }) {
   const crew = crewNames.length ? ` — Crew: ${crewNames.join(", ")}` : "";
   return `[JOB ${jobId}] ${who} — ${type}${crew}`;
 }
-
 function shouldRename(activity) {
   const t = (activity?.type || "").trim();
   return ALLOWED_TYPES.has(t);
 }
-
 function isAlreadyCanonical(currentSubject, canonical) {
   return (currentSubject || "").trim() === canonical.trim();
 }
 
-// Health
+// -------- Health --------
 app.get("/", (_req, res) => res.send("✅ PD Activity Renamer running"));
 
-// Webhook
+// -------- Webhook --------
 app.post("/", async (req, res) => {
+  const now = new Date().toISOString();
   try {
-    // Simple shared-secret check (?key=...)
+    // Shared-secret guard (?key=...)
     if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
 
+    // Grab activity id defensively (v1/v2 payload styles)
     const body = req.body || {};
-    // Pipedrive webhook payloads vary → be defensive
     const activityId = body?.current?.id || body?.activity?.id || body?.meta?.id;
 
     if (!activityId) {
-      console.log("❌ Missing activityId in webhook");
+      console.log(`[${now}] ❌ Missing activityId in webhook payload`);
       return res.status(200).send("no id");
     }
 
-    // Ack early so PD doesn't retry forever
+    // Ack quickly
     res.status(200).send("ok");
 
     const activity = await getActivity(activityId);
-    if (!activity) return console.log(`❌ Activity ${activityId} not found`);
+    if (!activity) return console.log(`[${now}] ❌ Activity ${activityId} not found`);
 
     if (!activity.deal_id) {
-      return console.log(`ℹ️ Activity ${activityId} has no deal; skipping`);
+      return console.log(`[${now}] ℹ️ Activity ${activityId} has no deal; skipping`);
     }
-    const deal = await getDeal(activity.deal_id);
-    if (!deal) return console.log(`❌ Deal ${activity.deal_id} not found`);
 
     if (!shouldRename(activity)) {
       return console.log(
-        `ℹ️ Activity ${activityId} type "${activity.type}" not allowed; skipping`
+        `[${now}] ℹ️ Activity ${activityId} type "${activity.type}" not in allowlist; skipping`
       );
     }
+
+    const deal = await getDeal(activity.deal_id);
+    if (!deal) return console.log(`[${now}] ❌ Deal ${activity.deal_id} not found`);
 
     const crew = crewNamesFromDeal(deal);
     if (crew.length === 0) {
       return console.log(
-        `ℹ️ Deal ${deal.id} has no Production Team set; skipping`
+        `[${now}] ℹ️ Deal ${deal.id} has no Production Team set or IDs unmapped; skipping`
       );
     }
 
     const canonical = buildSubject({ deal, activity, crewNames: crew });
+
     if (isAlreadyCanonical(activity.subject, canonical)) {
-      return console.log(`✅ Activity ${activityId} already canonical`);
+      return console.log(`[${now}] ✅ Activity ${activityId} already canonical`);
     }
 
-    // Rename (idempotent). This will re-fire activity.updated; safe due to check above
-    const update = await pd.put(`/activities/${activityId}`, {
-      subject: canonical
-    });
-
+    const update = await pd.put(`/activities/${activityId}`, { subject: canonical });
     if (update.data?.success) {
-      console.log(`✅ Renamed activity ${activityId} → "${canonical}"`);
+      console.log(`[${now}] ✅ Renamed activity ${activityId} → "${canonical}"`);
     } else {
-      console.log(`❌ Failed to update activity ${activityId}`, update.data);
+      console.log(`[${now}] ❌ Update failed`, update.data);
     }
   } catch (err) {
-    const msg = err?.response?.data || err.message;
-    console.error("❌ Exception:", msg);
+    console.error(`[${now}] ❌ Exception:`, err?.response?.data || err.message);
   }
 });
 
-// Boot
-app.listen(PORT, () => {
-  console.log(`🚀 Listening on ${PORT}`);
-});
+// -------- Boot --------
+app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
