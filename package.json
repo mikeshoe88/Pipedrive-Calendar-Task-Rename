@@ -1,14 +1,14 @@
 {
-  "name": "pipedrive-webhook-server",
+  "name": "pd-activity-renamer",
   "version": "1.0.0",
-  "description": "Webhook server for Pipedrive tasks",
+  "type": "commonjs",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.6.0",
+    "axios": "^1.7.2",
     "body-parser": "^1.20.2",
-    "express": "^4.18.2"
+    "express": "^4.19.2"
   }
 }
