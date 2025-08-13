@@ -38,6 +38,13 @@ const ALLOWED_TYPE_LABELS = new Set([
 const app = express();
 app.use(bodyParser.json({ type: "*/*" }));
 
+// ===== Request Logger (so we always see hits in Railway) =====
+app.use((req, _res, next) => {
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] ${req.method} ${req.path} q=${JSON.stringify(req.query)} ua=${req.get('user-agent')}`);
+  next();
+});
+
 const pd = axios.create({
   baseURL: "https://api.pipedrive.com/v1",
   params: { api_token: API_TOKEN },
@@ -90,6 +97,10 @@ async function getDeal(id) {
   const r = await withRetry(() => pd.get(`/deals/${id}`));
   return r.data?.success ? r.data.data : null;
 }
+async function listOpenActivitiesForDeal(dealId) {
+  const r = await withRetry(() => pd.get(`/activities`, { params: { deal_id: dealId, done: 0 } }));
+  return r.data?.success ? (r.data.data || []) : [];
+}
 function crewNamesFromDeal(deal) {
   const raw = deal?.[PRODUCTION_TEAM_FIELD_KEY];
   const ids = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
@@ -107,6 +118,41 @@ function shouldRenameByKey(typeKey) { return RENAME_ALL || ALLOWED_TYPE_KEYS.has
 
 // ===== Health =====
 app.get("/", (_req, res) => res.send("✅ PD Activity Renamer running"));
+app.get("/ping", (_req, res) => res.send("pong"));
+
+// ===== Manual sweep (for testing / Outlook sync cases) =====
+// GET /sweep?key=...&dealId=136
+app.get("/sweep", async (req, res) => {
+  if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
+  const dealId = Number(req.query.dealId);
+  if (!dealId) return res.status(400).json({ error: "missing dealId" });
+  const now = new Date().toISOString();
+  try {
+    const deal = await getDeal(dealId);
+    if (!deal) return res.status(404).json({ error: `Deal ${dealId} not found` });
+
+    const crew = crewNamesFromDeal(deal);
+    if (!crew.length) return res.status(200).json({ updated: 0, skipped: 0, msg: "no Production Team set" });
+
+    const acts = await listOpenActivitiesForDeal(dealId);
+    let updated = 0, skipped = 0;
+    for (const a of acts) {
+      const typeKey = (a?.type || "").trim();
+      if (!shouldRenameByKey(typeKey)) { skipped++; continue; }
+      const canonical = buildSubject({ deal, typeKey, crewNames: crew });
+      if (isAlreadyCanonical(a.subject, canonical)) { skipped++; continue; }
+      try {
+        const r = await withRetry(() => pd.put(`/activities/${a.id}`, { subject: canonical }));
+        if (r.data?.success) updated++;
+      } catch (e) {
+        console.error(`[${now}] ❌ Failed to update activity ${a.id}`, e?.response?.data || e.message);
+      }
+    }
+    return res.status(200).json({ updated, skipped, total: acts.length });
+  } catch (e) {
+    return res.status(500).json({ error: e?.response?.data || e.message });
+  }
+});
 
 // ===== Webhook =====
 app.post("/", async (req, res) => {
@@ -120,12 +166,9 @@ app.post("/", async (req, res) => {
 
     // v2 names we’ve seen: create.activity, change.activity
     const isActivityV2 = /\.activity$/.test(event);
-    const isCreate = event.startsWith("create.");
-    const isChange = event.startsWith("change.") || event.startsWith("update.") || event.startsWith("updated.");
 
     // v1 fallbacks
     const v1Object = meta.object || body?.current?.object || body?.current?.model; // 'activity'|'deal'
-    const v1Action = meta.action || ""; // 'added'|'updated'|...
 
     // Ack immediately
     res.status(200).send("ok");
@@ -159,11 +202,10 @@ app.post("/", async (req, res) => {
       const up = await withRetry(() => pd.put(`/activities/${activityId}`, { subject: canonical }));
       if (up.data?.success) console.log(`[${now}] ✅ Renamed activity ${activityId} → "${canonical}"`);
       else console.log(`[${now}] ❌ Update failed`, up.data);
-
-      return; // done
+      return;
     }
 
-    console.log(`[${now}] ℹ️ Unhandled payload`, { event, v1Object, v1Action });
+    console.log(`[${now}] ℹ️ Unhandled payload`, { event, v1Object });
   } catch (err) {
     console.error(`[${now}] ❌ Exception:`, err?.response?.data || err.message);
   }
