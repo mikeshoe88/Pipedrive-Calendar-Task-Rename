@@ -140,38 +140,49 @@ app.get("/__routes", (_req, res) => {
 });
 
 // ===== Manual sweep (for testing / Outlook sync cases) =====
-// GET /sweep?key=...&dealId=136 (for testing / Outlook sync cases) =====
-// GET /sweep?key=...&dealId=136
+// Shared sweep logic so both GET and POST can call it
+async function sweepDeal(dealId) {
+  const now = new Date().toISOString();
+  const deal = await getDeal(dealId);
+  if (!deal) return { error: `Deal ${dealId} not found` };
+  const crew = crewNamesFromDeal(deal);
+  if (!crew.length) return { updated: 0, skipped: 0, total: 0, msg: "no Production Team set" };
+  const acts = await listOpenActivitiesForDeal(dealId);
+  let updated = 0, skipped = 0;
+  for (const a of acts) {
+    const typeKey = (a?.type || "").trim();
+    if (!shouldRenameByKey(typeKey)) { skipped++; continue; }
+    const canonical = buildSubject({ deal, typeKey, crewNames: crew });
+    if (isAlreadyCanonical(a.subject, canonical)) { skipped++; continue; }
+    try {
+      const r = await withRetry(() => pd.put(`/activities/${a.id}`, { subject: canonical }));
+      if (r.data?.success) updated++;
+    } catch (e) {
+      console.error(`[${now}] ❌ Failed to update activity ${a.id}`, e?.response?.data || e.message);
+    }
+  }
+  return { updated, skipped, total: acts.length };
+}
+
+// GET /sweep?key=...&dealId=136 (simple manual trigger)
 app.get("/sweep", async (req, res) => {
   if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
   const dealId = Number(req.query.dealId);
   if (!dealId) return res.status(400).json({ error: "missing dealId" });
-  const now = new Date().toISOString();
-  try {
-    const deal = await getDeal(dealId);
-    if (!deal) return res.status(404).json({ error: `Deal ${dealId} not found` });
+  try { return res.status(200).json(await sweepDeal(dealId)); }
+  catch (e) { return res.status(500).json({ error: e?.response?.data || e.message }); }
+});
 
-    const crew = crewNamesFromDeal(deal);
-    if (!crew.length) return res.status(200).json({ updated: 0, skipped: 0, msg: "no Production Team set" });
-
-    const acts = await listOpenActivitiesForDeal(dealId);
-    let updated = 0, skipped = 0;
-    for (const a of acts) {
-      const typeKey = (a?.type || "").trim();
-      if (!shouldRenameByKey(typeKey)) { skipped++; continue; }
-      const canonical = buildSubject({ deal, typeKey, crewNames: crew });
-      if (isAlreadyCanonical(a.subject, canonical)) { skipped++; continue; }
-      try {
-        const r = await withRetry(() => pd.put(`/activities/${a.id}`, { subject: canonical }));
-        if (r.data?.success) updated++;
-      } catch (e) {
-        console.error(`[${now}] ❌ Failed to update activity ${a.id}`, e?.response?.data || e.message);
-      }
-    }
-    return res.status(200).json({ updated, skipped, total: acts.length });
-  } catch (e) {
-    return res.status(500).json({ error: e?.response?.data || e.message });
-  }
+// POST /sweep (for Pipedrive Workflow Automation "Send Webhook")
+// Accepts JSON or form body with { dealId: 136 }, or query ?dealId=136
+app.post("/sweep", async (req, res) => {
+  if ((req.query.key || req.body?.key) !== PD_SECRET) return res.status(401).send("nope");
+  let dealId = Number(req.body?.dealId || req.query?.dealId);
+  // Some PD automations send { current: { id: <dealId> } }
+  if (!dealId) dealId = Number(req.body?.current?.id || req.body?.meta?.id);
+  if (!dealId) return res.status(400).json({ error: "missing dealId" });
+  try { return res.status(200).json(await sweepDeal(dealId)); }
+  catch (e) { return res.status(500).json({ error: e?.response?.data || e.message }); }
 });
 
 // ===== Debug endpoints =====
