@@ -2,17 +2,18 @@ const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
 
-// ===== Required env (no fallbacks) =====
+// ===== ENV =====
 const PORT = process.env.PORT || 8080;
 const API_TOKEN = process.env.API_TOKEN; // Pipedrive API token
-const PD_SECRET = process.env.PD_WEBHOOK_KEY; // shared secret used as ?key=...
-const PRODUCTION_TEAM_FIELD_KEY = process.env.PRODUCTION_TEAM_FIELD_KEY; // e.g. "5b436b45b63857305f9691910b6567351b5517bc"
+const PD_SECRET = process.env.PD_WEBHOOK_KEY; // ?key=...
+const PRODUCTION_TEAM_FIELD_KEY = process.env.PRODUCTION_TEAM_FIELD_KEY; // e.g., 5b43...
+const RENAME_ALL = (process.env.RENAME_ALL || "true").toLowerCase() === "true"; // force rename regardless of type
 
 if (!API_TOKEN) throw new Error("Missing API_TOKEN");
 if (!PD_SECRET) throw new Error("Missing PD_WEBHOOK_KEY");
 if (!PRODUCTION_TEAM_FIELD_KEY) throw new Error("Missing PRODUCTION_TEAM_FIELD_KEY");
 
-// Map your Production Team enum IDs -> names (confirm 54 is Kim vs Gary)
+// Map your Production Team enum IDs -> names
 const PRODUCTION_TEAM_MAP = {
   47: "Kings",
   48: "Johnathan",
@@ -21,11 +22,10 @@ const PRODUCTION_TEAM_MAP = {
   51: "Sebastian",
   52: "Anastacio",
   53: "Mike",
-  54: "Kim"
+  54: "Kim",
 };
 
-// Configure which *labels* (human names) should be renamed.
-// We'll translate labels -> type keys at boot using /activityTypes
+// Optional allowlist (labels) if you later set RENAME_ALL=false
 const ALLOWED_TYPE_LABELS = new Set([
   "Moisture Check",
   "Moisture Pickup",
@@ -42,15 +42,15 @@ const pd = axios.create({
   baseURL: "https://api.pipedrive.com/v1",
   params: { api_token: API_TOKEN },
   headers: { "Content-Type": "application/json" },
-  timeout: 12000,
+  timeout: 15000,
 });
 
-// ===== Simple retry helper for PD 429/5xx =====
+// ===== Retry helper =====
 async function withRetry(fn, tries = 3) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try { return await fn(); } catch (err) {
-      const code = err?.response?.status;
+      const code = err?.response?.status || 0;
       if (code === 429 || (code >= 500 && code < 600)) {
         await new Promise(r => setTimeout(r, (i + 1) * 400));
         lastErr = err; continue;
@@ -61,61 +61,49 @@ async function withRetry(fn, tries = 3) {
   throw lastErr;
 }
 
-// ===== Activity Type cache (label <-> key) =====
-let TYPE_KEY_BY_LABEL = {};   // { "Moisture Check": "moisture_check" }
-let TYPE_LABEL_BY_KEY = {};   // { "moisture_check": "Moisture Check" }
-let ALLOWED_TYPE_KEYS = new Set(); // derived from ALLOWED_TYPE_LABELS
+// ===== Activity type cache (labels <-> keys) =====
+let TYPE_KEY_BY_LABEL = {};   // { "Demo": "demo" }
+let TYPE_LABEL_BY_KEY = {};   // { "demo": "Demo" }
+let ALLOWED_TYPE_KEYS = new Set();
 
 async function warmActivityTypes() {
-  const r = await withRetry(() => pd.get("/activityTypes"));
-  const list = r.data?.data || [];
-  TYPE_KEY_BY_LABEL = {};
-  TYPE_LABEL_BY_KEY = {};
-  for (const t of list) {
-    // t = { id, key, name }
-    TYPE_KEY_BY_LABEL[t.name] = t.key;
-    TYPE_LABEL_BY_KEY[t.key] = t.name;
+  try {
+    const r = await withRetry(() => pd.get("/activityTypes"));
+    const list = r.data?.data || [];
+    TYPE_KEY_BY_LABEL = {}; TYPE_LABEL_BY_KEY = {};
+    for (const t of list) { TYPE_KEY_BY_LABEL[t.name] = t.key; TYPE_LABEL_BY_KEY[t.key] = t.name; }
+    ALLOWED_TYPE_KEYS = new Set(
+      Array.from(ALLOWED_TYPE_LABELS).map(label => TYPE_KEY_BY_LABEL[label]).filter(Boolean)
+    );
+    console.log("✅ Cached activity types. Allowed keys:", Array.from(ALLOWED_TYPE_KEYS));
+  } catch (e) {
+    console.warn("⚠️ Could not warm activity types (will still work w/ RENAME_ALL=true)", e?.response?.data || e.message);
   }
-  // Build allowlist of type *keys* from the *labels* you configured above
-  ALLOWED_TYPE_KEYS = new Set(
-    Array.from(ALLOWED_TYPE_LABELS)
-      .map(label => TYPE_KEY_BY_LABEL[label])
-      .filter(Boolean)
-  );
-  console.log("✅ Activity types cached. Allowed keys:", Array.from(ALLOWED_TYPE_KEYS));
 }
 
 // ===== Helpers =====
-async function getActivity(activityId) {
-  const r = await withRetry(() => pd.get(`/activities/${activityId}`));
+async function getActivity(id) {
+  const r = await withRetry(() => pd.get(`/activities/${id}`));
   return r.data?.success ? r.data.data : null;
 }
-async function getDeal(dealId) {
-  const r = await withRetry(() => pd.get(`/deals/${dealId}`));
+async function getDeal(id) {
+  const r = await withRetry(() => pd.get(`/deals/${id}`));
   return r.data?.success ? r.data.data : null;
-}
-async function listOpenActivitiesForDeal(dealId) {
-  const r = await withRetry(() => pd.get(`/activities`, { params: { deal_id: dealId, done: 0 } }));
-  return r.data?.success ? (r.data.data || []) : [];
 }
 function crewNamesFromDeal(deal) {
   const raw = deal?.[PRODUCTION_TEAM_FIELD_KEY];
   const ids = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
   return ids.map((id) => PRODUCTION_TEAM_MAP[id]).filter(Boolean);
 }
-function buildSubject({ deal, activityTypeKey, crewNames }) {
+function buildSubject({ deal, typeKey, crewNames }) {
   const jobId = deal?.id;
   const who = deal?.org_id?.name || deal?.person_id?.name || deal?.title || "Deal";
-  const typeLabel = TYPE_LABEL_BY_KEY[activityTypeKey] || activityTypeKey || "Activity";
+  const typeLabel = TYPE_LABEL_BY_KEY[typeKey] || typeKey || "Activity";
   const crew = crewNames.length ? ` — Crew: ${crewNames.join(", ")}` : "";
   return `[JOB ${jobId}] ${who} — ${typeLabel}${crew}`;
 }
-function shouldRenameByKey(activityTypeKey) {
-  return ALLOWED_TYPE_KEYS.has(activityTypeKey);
-}
-function isAlreadyCanonical(currentSubject, canonical) {
-  return (currentSubject || "").trim() === canonical.trim();
-}
+function isAlreadyCanonical(curr, next) { return (curr || "").trim() === next.trim(); }
+function shouldRenameByKey(typeKey) { return RENAME_ALL || ALLOWED_TYPE_KEYS.has(typeKey); }
 
 // ===== Health =====
 app.get("/", (_req, res) => res.send("✅ PD Activity Renamer running"));
@@ -124,100 +112,65 @@ app.get("/", (_req, res) => res.send("✅ PD Activity Renamer running"));
 app.post("/", async (req, res) => {
   const now = new Date().toISOString();
   try {
-    // Shared-secret guard (?key=...)
     if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
 
     const body = req.body || {};
+    const event = String(body.event || "");
     const meta = body.meta || {};
-    const object = meta.object || body?.current?.object || body?.current?.model; // 'activity' or 'deal'
-    const action = meta.action || body?.event || ""; // 'added'|'updated'|...
+
+    // v2 names we’ve seen: create.activity, change.activity
+    const isActivityV2 = /\.activity$/.test(event);
+    const isCreate = event.startsWith("create.");
+    const isChange = event.startsWith("change.") || event.startsWith("update.") || event.startsWith("updated.");
+
+    // v1 fallbacks
+    const v1Object = meta.object || body?.current?.object || body?.current?.model; // 'activity'|'deal'
+    const v1Action = meta.action || ""; // 'added'|'updated'|...
 
     // Ack immediately
     res.status(200).send("ok");
 
-    // === When an ACTIVITY is added/updated ===
-    if (object === "activity") {
-      const activityId = body?.current?.id || body?.activity?.id || meta?.id;
-      if (!activityId) return console.log(`[${now}] ❌ Missing activityId in activity webhook`);
+    // === Activity path (v2 or v1) ===
+    if (isActivityV2 || v1Object === "activity") {
+      const activityId = body?.current?.id || body?.activity?.id || meta?.id || meta?.object_id || body?.id;
+      if (!activityId) return console.log(`[${now}] ❌ Missing activityId`, { event, meta });
 
       const activity = await getActivity(activityId);
       if (!activity) return console.log(`[${now}] ❌ Activity ${activityId} not found`);
-
-      if (!activity.deal_id) {
-        return console.log(`[${now}] ℹ️ Activity ${activityId} has no deal; skipping`);
-      }
-
-      const typeKey = (activity?.type || "").trim(); // API returns the *key*, not label
-      if (!shouldRenameByKey(typeKey)) {
-        return console.log(`[${now}] ℹ️ Activity ${activityId} type "${typeKey}" not in allowlist; skipping`);
-      }
+      if (!activity.deal_id) return console.log(`[${now}] ℹ️ Activity ${activityId} has no deal; skipping`);
 
       const deal = await getDeal(activity.deal_id);
       if (!deal) return console.log(`[${now}] ❌ Deal ${activity.deal_id} not found`);
 
       const crew = crewNamesFromDeal(deal);
-      if (crew.length === 0) {
-        return console.log(`[${now}] ℹ️ Deal ${deal.id} has no Production Team set or IDs unmapped; skipping`);
+      if (!crew.length) return console.log(`[${now}] ℹ️ Deal ${deal.id} has no Production Team set or unmapped; skipping`);
+
+      const typeKey = (activity?.type || "").trim();
+      if (!shouldRenameByKey(typeKey)) {
+        const label = TYPE_LABEL_BY_KEY[typeKey] || typeKey || "(unknown)";
+        return console.log(`[${now}] ℹ️ Skipping type '${label}' (${typeKey}) by config`);
       }
 
-      const canonical = buildSubject({ deal, activityTypeKey: typeKey, crewNames: crew });
+      const canonical = buildSubject({ deal, typeKey, crewNames: crew });
       if (isAlreadyCanonical(activity.subject, canonical)) {
-        return console.log(`[${now}] ✅ Activity ${activityId} already canonical`);
+        return console.log(`[${now}] ✅ Already canonical for activity ${activityId}`);
       }
 
-      const update = await withRetry(() => pd.put(`/activities/${activityId}`, { subject: canonical }));
-      if (update.data?.success) {
-        console.log(`[${now}] ✅ Renamed activity ${activityId} → "${canonical}"`);
-      } else {
-        console.log(`[${now}] ❌ Update failed`, update.data);
-      }
+      const up = await withRetry(() => pd.put(`/activities/${activityId}`, { subject: canonical }));
+      if (up.data?.success) console.log(`[${now}] ✅ Renamed activity ${activityId} → "${canonical}"`);
+      else console.log(`[${now}] ❌ Update failed`, up.data);
+
       return; // done
     }
 
-    // === When a DEAL is updated (e.g., Production Team changed) ===
-    if (object === "deal" && action === "updated") {
-      const dealId = body?.current?.id || meta?.id || body?.deal?.id;
-      if (!dealId) return console.log(`[${now}] ❌ Missing dealId in deal webhook`);
-
-      const deal = await getDeal(dealId);
-      if (!deal) return console.log(`[${now}] ❌ Deal ${dealId} not found`);
-
-      const crew = crewNamesFromDeal(deal);
-      if (crew.length === 0) {
-        return console.log(`[${now}] ℹ️ Deal ${deal.id} has no Production Team set or IDs unmapped; skipping`);
-      }
-
-      const acts = await listOpenActivitiesForDeal(dealId);
-      if (!acts.length) return console.log(`[${now}] ℹ️ Deal ${dealId} has no open activities`);
-
-      let touched = 0, skipped = 0;
-      for (const a of acts) {
-        const typeKey = (a?.type || "").trim();
-        if (!shouldRenameByKey(typeKey)) { skipped++; continue; }
-        const canonical = buildSubject({ deal, activityTypeKey: typeKey, crewNames: crew });
-        if (isAlreadyCanonical(a.subject, canonical)) { skipped++; continue; }
-        try {
-          const r = await withRetry(() => pd.put(`/activities/${a.id}`, { subject: canonical }));
-          if (r.data?.success) touched++;
-        } catch (err) {
-          console.error(`[${now}] ❌ Failed to update activity ${a.id}`, err?.response?.data || err.message);
-        }
-      }
-      console.log(`[${now}] ✅ Deal ${dealId} crew change pass — updated: ${touched}, skipped: ${skipped}, total open: ${acts.length}`);
-      return; // done
-    }
-
-    console.log(`[${now}] ℹ️ Unhandled webhook payload`, { object, action });
+    console.log(`[${now}] ℹ️ Unhandled payload`, { event, v1Object, v1Action });
   } catch (err) {
-    const now2 = new Date().toISOString();
-    console.error(`[${now2}] ❌ Exception:`, err?.response?.data || err.message);
+    console.error(`[${now}] ❌ Exception:`, err?.response?.data || err.message);
   }
 });
 
 // ===== Boot =====
 (async () => {
-  await warmActivityTypes().catch((e) => {
-    console.error("Failed to warm activity types:", e?.response?.data || e.message);
-  });
+  await warmActivityTypes();
   app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
 })();
