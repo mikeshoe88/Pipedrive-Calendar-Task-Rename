@@ -1,17 +1,14 @@
 {
   "name": "pd-activity-renamer",
-  "version": "1.0.0",
+  "private": true,
   "type": "commonjs",
-  "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "webhooks:create": "node scripts/webhooks-create.js",
-    "webhooks:list": "node scripts/webhooks-list.js",
-    "webhooks:delete": "node scripts/webhooks-delete.js"
+    "start": "node index.js"
   },
   "dependencies": {
+    "express": "^4.19.2",
     "axios": "^1.7.2",
-    "body-parser": "^1.20.2",
-    "express": "^4.19.2"
-  }
+    "body-parser": "^1.20.2"
+  },
+  "engines": { "node": ">=18" }
 }
