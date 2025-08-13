@@ -6,8 +6,11 @@ const axios = require("axios");
 const PORT = process.env.PORT || 8080;
 const API_TOKEN = process.env.API_TOKEN; // Pipedrive API token
 const PD_SECRET = process.env.PD_WEBHOOK_KEY; // ?key=...
-const PRODUCTION_TEAM_FIELD_KEY = process.env.PRODUCTION_TEAM_FIELD_KEY; // e.g., 5b43...
-const RENAME_ALL = (process.env.RENAME_ALL || "true").toLowerCase() === "true"; // force rename regardless of type
+const PRODUCTION_TEAM_FIELD_KEY = process.env.PRODUCTION_TEAM_FIELD_KEY; // e.g., 8bbab3c120ade3217b8738f001033064e803cdef
+const RENAME_ALL = (process.env.RENAME_ALL || "true").toLowerCase() === "true"; // rename regardless of type
+const POLLER_ENABLED = (process.env.POLLER_ENABLED || "true").toLowerCase() === "true"; // enable background poller
+const POLLER_INTERVAL_MS = Number(process.env.POLLER_INTERVAL_MS || 5 * 60 * 1000); // 5 min
+const POLLER_WINDOW_MIN = Number(process.env.POLLER_WINDOW_MIN || 60); // look back 60 min on first run
 
 if (!API_TOKEN) throw new Error("Missing API_TOKEN");
 if (!PD_SECRET) throw new Error("Missing PD_WEBHOOK_KEY");
@@ -36,7 +39,9 @@ const ALLOWED_TYPE_LABELS = new Set([
 ]);
 
 const app = express();
-app.use(bodyParser.json({ type: "*/*" }));
+// Parse common webhook content-types
+app.use(bodyParser.json()); // application/json
+app.use(bodyParser.urlencoded({ extended: true })); // application/x-www-form-urlencoded
 
 // ===== Request Logger (so we always see hits in Railway) =====
 app.use((req, _res, next) => {
@@ -49,7 +54,7 @@ const pd = axios.create({
   baseURL: "https://api.pipedrive.com/v1",
   params: { api_token: API_TOKEN },
   headers: { "Content-Type": "application/json" },
-  timeout: 15000,
+  timeout: 20000,
 });
 
 // ===== Retry helper =====
@@ -115,12 +120,27 @@ function buildSubject({ deal, typeKey, crewNames }) {
 }
 function isAlreadyCanonical(curr, next) { return (curr || "").trim() === next.trim(); }
 function shouldRenameByKey(typeKey) { return RENAME_ALL || ALLOWED_TYPE_KEYS.has(typeKey); }
+function parseMs(iso) { return iso ? Date.parse(iso) || 0 : 0; }
 
 // ===== Health =====
 app.get("/", (_req, res) => res.send("✅ PD Activity Renamer running"));
 app.get("/ping", (_req, res) => res.send("pong"));
+// Quick version + route introspection to verify deploy
+const APP_VERSION = process.env.APP_VERSION || "v-debug-1";
+app.get("/version", (_req, res) => res.json({ version: APP_VERSION }));
+app.get("/__routes", (_req, res) => {
+  const routes = [];
+  (app._router?.stack || []).forEach((m) => {
+    if (m.route && m.route.path) {
+      const methods = Object.keys(m.route.methods || {}).map(k => k.toUpperCase());
+      routes.push({ methods, path: m.route.path });
+    }
+  });
+  res.json({ version: APP_VERSION, routes });
+});
 
 // ===== Manual sweep (for testing / Outlook sync cases) =====
+// GET /sweep?key=...&dealId=136 (for testing / Outlook sync cases) =====
 // GET /sweep?key=...&dealId=136
 app.get("/sweep", async (req, res) => {
   if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
@@ -154,21 +174,127 @@ app.get("/sweep", async (req, res) => {
   }
 });
 
-// ===== Webhook =====
+// ===== Debug endpoints =====
+app.get("/debug-deal", async (req, res) => {
+  if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
+  const dealId = Number(req.query.dealId);
+  if (!dealId) return res.status(400).json({ error: "missing dealId" });
+  try {
+    const d = await getDeal(dealId);
+    if (!d) return res.status(404).json({ error: `Deal ${dealId} not found` });
+    res.json({
+      dealId: d.id,
+      title: d.title,
+      teamFieldKey: PRODUCTION_TEAM_FIELD_KEY,
+      teamRaw: d[PRODUCTION_TEAM_FIELD_KEY],
+      crewNames: crewNamesFromDeal(d),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e?.response?.data || e.message });
+  }
+});
+app.get("/debug-activity", async (req, res) => {
+  if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
+  const activityId = Number(req.query.activityId);
+  if (!activityId) return res.status(400).json({ error: "missing activityId" });
+  try {
+    const a = await getActivity(activityId);
+    if (!a) return res.status(404).json({ error: `Activity ${activityId} not found` });
+    res.json({
+      activityId: a.id,
+      subject: a.subject,
+      typeKey: a.type,
+      deal_id: a.deal_id,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e?.response?.data || e.message });
+  }
+});
+
+// ===== Poller (NO WEBHOOKS NEEDED) =====
+let lastPollMs = Date.now() - POLLER_WINDOW_MIN * 60 * 1000; // start by looking back POLLER_WINDOW_MIN
+async function pollDealsUpdatedSince() {
+  const startTs = new Date(lastPollMs).toISOString();
+  const nowMs = Date.now();
+  let start = 0, touched = 0, scannedDeals = 0, stop = false;
+  console.log(`[poll] starting from ${startTs}`);
+  while (!stop) {
+    const r = await withRetry(() => pd.get(`/deals`, { params: { start, limit: 100, sort: "update_time DESC" } }));
+    const deals = r.data?.data || [];
+    if (!deals.length) break;
+    for (const d of deals) {
+      const upd = parseMs(d.update_time);
+      if (upd && upd < lastPollMs - 60 * 1000) { // 1 min buffer
+        stop = true; break;
+      }
+      scannedDeals++;
+      try {
+        const deal = await getDeal(d.id); // need full fields + org/person
+        const crew = crewNamesFromDeal(deal);
+        if (!crew.length) continue;
+        const acts = await listOpenActivitiesForDeal(deal.id);
+        for (const a of acts) {
+          const typeKey = (a?.type || "").trim();
+          if (!shouldRenameByKey(typeKey)) continue;
+          const canonical = buildSubject({ deal, typeKey, crewNames: crew });
+          if (isAlreadyCanonical(a.subject, canonical)) continue;
+          try {
+            const up = await withRetry(() => pd.put(`/activities/${a.id}`, { subject: canonical }));
+            if (up.data?.success) touched++;
+          } catch (e) {
+            console.error(`[poll] ❌ Failed to update activity ${a.id}`, e?.response?.data || e.message);
+          }
+        }
+      } catch (e) {
+        console.error(`[poll] ⚠️ error on deal ${d.id}`, e?.response?.data || e.message);
+      }
+    }
+    start += 100;
+    if (deals.length < 100) break;
+  }
+  lastPollMs = nowMs;
+  console.log(`[poll] done — updated activities=${touched}, scannedDeals=${scannedDeals}, next start=${new Date(lastPollMs).toISOString()}`);
+}
+
+// Manual trigger: GET /poll-now?key=...
+app.get("/poll-now", async (req, res) => {
+  if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
+  try {
+    await pollDealsUpdatedSince();
+    res.status(200).send("ok");
+  } catch (e) {
+    res.status(500).json({ error: e?.response?.data || e.message });
+  }
+});
+
+// ===== Webhook (optional; keeps working if you enable it later) =====
 app.post("/", async (req, res) => {
   const now = new Date().toISOString();
   try {
     if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
 
-    const body = req.body || {};
+    // --- Normalize body across PD variations ---
+    let body = req.body || {};
+    // If PD posts as urlencoded with a JSON string in `payload`, parse it
+    if (body && typeof body.payload === "string") {
+      try { body = JSON.parse(body.payload); } catch (_) {}
+    }
+    // If PD posts raw text JSON (unlikely), try parsing
+    if (typeof body === "string") {
+      try { body = JSON.parse(body); } catch (_) {}
+    }
+
+    console.log(`[webhook] ct=${req.get('content-type')} keys=${Object.keys(body||{}).join(',')}`);
     const event = String(body.event || "");
     const meta = body.meta || {};
 
     // v2 names we’ve seen: create.activity, change.activity
-    const isActivityV2 = /\.activity$/.test(event);
+    const isActivityV2 = /\.activity$/.test(body.event || "");
 
     // v1 fallbacks
-    const v1Object = meta.object || body?.current?.object || body?.current?.model; // 'activity'|'deal'
+    const v1Object = body.object || meta.object || body?.current?.object || body?.current?.model; // 'activity'|'deal' || body?.current?.object || body?.current?.model; // 'activity'|'deal'
+
+    console.log(`[webhook] event=${event} v1Object=${v1Object} idHint=${meta?.id || meta?.object_id || body?.current?.id || body?.activity?.id || body?.id}`);
 
     // Ack immediately
     res.status(200).send("ok");
@@ -214,5 +340,15 @@ app.post("/", async (req, res) => {
 // ===== Boot =====
 (async () => {
   await warmActivityTypes();
+  if (POLLER_ENABLED) {
+    console.log(`⏱️ Poller enabled: interval=${POLLER_INTERVAL_MS}ms, window=${POLLER_WINDOW_MIN}min`);
+    setInterval(() => {
+      pollDealsUpdatedSince().catch((e) => console.error("[poll] run error", e?.response?.data || e.message));
+    }, POLLER_INTERVAL_MS);
+    // Kick once on boot so you can see it working immediately
+    pollDealsUpdatedSince().catch((e) => console.error("[poll] boot error", e?.response?.data || e.message));
+  } else {
+    console.log("⏸️ Poller disabled (POLLER_ENABLED=false)");
+  }
   app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
 })();
