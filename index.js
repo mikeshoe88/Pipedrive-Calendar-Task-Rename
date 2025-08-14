@@ -9,7 +9,7 @@ const PD_SECRET = process.env.PD_WEBHOOK_KEY; // ?key=...
 const PRODUCTION_TEAM_FIELD_KEY = process.env.PRODUCTION_TEAM_FIELD_KEY; // e.g., 8bbab3c120ade3217b8738f001033064e803cdef
 const RENAME_ALL = (process.env.RENAME_ALL || "true").toLowerCase() === "true"; // rename regardless of type
 const POLLER_ENABLED = (process.env.POLLER_ENABLED || "true").toLowerCase() === "true"; // enable background poller
-const POLLER_INTERVAL_MS = Number(process.env.POLLER_INTERVAL_MS || 5 * 60 * 1000); // 5 min
+const POLLER_INTERVAL_MS = Number(process.env.POLLER_INTERVAL_MS || 15 * 1000); // 15s default for near real-time crew updates
 const POLLER_WINDOW_MIN = Number(process.env.POLLER_WINDOW_MIN || 60); // look back 60 min on first run
 
 if (!API_TOKEN) throw new Error("Missing API_TOKEN");
@@ -126,7 +126,7 @@ function parseMs(iso) { return iso ? Date.parse(iso) || 0 : 0; }
 app.get("/", (_req, res) => res.send("✅ PD Activity Renamer running"));
 app.get("/ping", (_req, res) => res.send("pong"));
 // Quick version + route introspection to verify deploy
-const APP_VERSION = process.env.APP_VERSION || "v-debug-1";
+const APP_VERSION = process.env.APP_VERSION || "v-fast-15s";
 app.get("/version", (_req, res) => res.json({ version: APP_VERSION }));
 app.get("/__routes", (_req, res) => {
   const routes = [];
@@ -372,4 +372,3 @@ app.post("/", async (req, res) => {
   }
   app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
 })();
-
