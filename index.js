@@ -342,6 +342,15 @@ app.post("/", async (req, res) => {
       return;
     }
 
+    // === Deal path (v2 or v1) — sweep all open activities instantly ===
+    const isDealV2 = /\.deal$/.test(event);
+    if (isDealV2 || v1Object === "deal") {
+      const dealId = Number(body?.current?.id || body?.deal?.id || meta?.id || meta?.object_id || body?.id);
+      if (!dealId) return console.log(`[${now}] ❌ Missing dealId for event '${event}'`, { meta });
+      const result = await sweepDeal(dealId);
+      return console.log(`[${now}] ✅ Deal webhook sweep`, { dealId, result });
+    }
+
     console.log(`[${now}] ℹ️ Unhandled payload`, { event, v1Object });
   } catch (err) {
     console.error(`[${now}] ❌ Exception:`, err?.response?.data || err.message);
@@ -363,3 +372,4 @@ app.post("/", async (req, res) => {
   }
   app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
 })();
+
