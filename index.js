@@ -11,12 +11,13 @@ const RENAME_ALL = (process.env.RENAME_ALL || "true").toLowerCase() === "true"; 
 const POLLER_ENABLED = (process.env.POLLER_ENABLED || "true").toLowerCase() === "true"; // enable background poller
 const POLLER_INTERVAL_MS = Number(process.env.POLLER_INTERVAL_MS || 15 * 1000); // 15s default for near real-time crew updates
 const POLLER_WINDOW_MIN = Number(process.env.POLLER_WINDOW_MIN || 60); // look back 60 min on first run
+const APP_VERSION = process.env.APP_VERSION || "v-crew-map-2025-08-19";
 
 if (!API_TOKEN) throw new Error("Missing API_TOKEN");
 if (!PD_SECRET) throw new Error("Missing PD_WEBHOOK_KEY");
 if (!PRODUCTION_TEAM_FIELD_KEY) throw new Error("Missing PRODUCTION_TEAM_FIELD_KEY");
 
-// Map your Production Team enum IDs -> names
+// Map your Production Team enum IDs -> names (FIXED: 54=Gary; added 55-57, plus future slots)
 const PRODUCTION_TEAM_MAP = {
   47: "Kings",
   48: "Johnathan",
@@ -25,7 +26,13 @@ const PRODUCTION_TEAM_MAP = {
   51: "Sebastian",
   52: "Anastacio",
   53: "Mike",
-  54: "Kim",
+  54: "Gary",       // was "Kim" — corrected ✅
+  55: "Greg",       // added ✅
+  56: "Amber",      // added ✅
+  57: "Anna Marie", // added ✅
+  58: "Slot 3",
+  59: "Slot 4",
+  60: "Slot 5",
 };
 
 // Optional allowlist (labels) if you later set RENAME_ALL=false
@@ -109,6 +116,7 @@ async function listOpenActivitiesForDeal(dealId) {
 function crewNamesFromDeal(deal) {
   const raw = deal?.[PRODUCTION_TEAM_FIELD_KEY];
   const ids = Array.isArray(raw) ? raw : raw == null ? [] : [raw];
+  // Map ids -> names; filter unknown ids to avoid wrong subjects
   return ids.map((id) => PRODUCTION_TEAM_MAP[id]).filter(Boolean);
 }
 function buildSubject({ deal, typeKey, crewNames }) {
@@ -125,8 +133,6 @@ function parseMs(iso) { return iso ? Date.parse(iso) || 0 : 0; }
 // ===== Health =====
 app.get("/", (_req, res) => res.send("✅ PD Activity Renamer running"));
 app.get("/ping", (_req, res) => res.send("pong"));
-// Quick version + route introspection to verify deploy
-const APP_VERSION = process.env.APP_VERSION || "v-fast-15s";
 app.get("/version", (_req, res) => res.json({ version: APP_VERSION }));
 app.get("/__routes", (_req, res) => {
   const routes = [];
@@ -137,6 +143,11 @@ app.get("/__routes", (_req, res) => {
     }
   });
   res.json({ version: APP_VERSION, routes });
+});
+// Quick map check to verify names are correct in prod
+app.get("/debug-map", (req, res) => {
+  if (req.query.key !== PD_SECRET) return res.status(401).send("nope");
+  res.json({ version: APP_VERSION, teamFieldKey: PRODUCTION_TEAM_FIELD_KEY, map: PRODUCTION_TEAM_MAP });
 });
 
 // ===== Manual sweep (for testing / Outlook sync cases) =====
@@ -303,7 +314,7 @@ app.post("/", async (req, res) => {
     const isActivityV2 = /\.activity$/.test(body.event || "");
 
     // v1 fallbacks
-    const v1Object = body.object || meta.object || body?.current?.object || body?.current?.model; // 'activity'|'deal' || body?.current?.object || body?.current?.model; // 'activity'|'deal'
+    const v1Object = body.object || meta.object || body?.current?.object || body?.current?.model; // 'activity'|'deal'
 
     console.log(`[webhook] event=${event} v1Object=${v1Object} idHint=${meta?.id || meta?.object_id || body?.current?.id || body?.activity?.id || body?.id}`);
 
@@ -370,5 +381,5 @@ app.post("/", async (req, res) => {
   } else {
     console.log("⏸️ Poller disabled (POLLER_ENABLED=false)");
   }
-  app.listen(PORT, () => console.log(`🚀 Listening on ${PORT}`));
+  app.listen(PORT, () => console.log(`🚀 Listening on ${PORT} — ${APP_VERSION}`));
 })();
